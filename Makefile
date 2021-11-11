@@ -34,6 +34,7 @@ endif
 # install linter tool
 .PHONY: install-linter
 install-linter:
+	$(info GOLANGCI-LATEST-VERSION=$(GOLANGCI_LATEST_VERSION))
 ifneq ($(GOLANGCI_CUR_VERSION), $(GOLANGCI_LATEST_VERSION))
 	$(info Installing GOLANGCI-LINT $(GOLANGCI_LATEST_VERSION)...)
 	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s $(GOLANGCI_LATEST_VERSION)

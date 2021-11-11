@@ -4,7 +4,7 @@ export GO111MODULE=on
 $(value $(shell [ ! -d "$(CURDIR)/bin" ] && mkdir -p "$(CURDIR)/bin"))
 export GOBIN=$(CURDIR)/bin
 GOLANGCI_BIN:=$(GOBIN)/golangci-lint
-GOLANGCI_REPO:=git@github.com:golangci/golangci-lint.git
+GOLANGCI_REPO:=https://github.com/golangci/golangci-lint.git
 GOLANGCI_LATEST_VERSION:= $(shell git ls-remote --tags --refs --sort='v:refname' $(GOLANGCI_REPO)|tail -1|egrep -E -o "v\d+\.\d+\..*")
 
 GIT_TAG:=$(shell git describe --exact-match --abbrev=0 --tags 2> /dev/null)

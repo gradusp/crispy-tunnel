@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+package crispy.tunnel;
+option go_package = "/tunnel";
+
+//import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+import "google/api/annotations.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+
+
+option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
+  info: {
+    title: "Tunnel public API";
+    version: "2.0";
+    contact: {
+      name: "Pavel Fiskovich";
+      url: "https://blog.bullgare.com/2020/07/complete-list-of-swagger-options-to-protobuf-file";
+    };
+  };
+  schemes: [HTTP];
+  consumes: "application/json";
+  produces: "application/json";
+};
+
+//TunnelService сервис управления туннелями
+service TunnelService {
+  //AddTunnel добавить туннель
+  rpc AddTunnel(AddTunnelRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      post: "/v2/tunnel/add"
+      body: "*"
+    };
+  }
+
+  //RemoveTunnel удалить туннель
+  rpc RemoveTunnel(RemoveTunnelRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      post: "/v2/tunnel/remove"
+      body: "*"
+    };
+  }
+
+  //GetState вернуть все туннели
+  rpc GetState(google.protobuf.Empty) returns (GetStateResponse) {
+    option (google.api.http) = {
+      get: "/v2/tunnel/state"
+    };
+  }
+}
+
+//AddTunnelRequest добавить туннель
+message AddTunnelRequest {
+  string tunDestIP = 1;
+}
+
+//AddTunnelRequest добавить туннель
+message RemoveTunnelRequest {
+  string tunDestIP = 1;
+}
+
+//GetStateResponse выдаем все туннели
+message GetStateResponse {
+  //tunnels список туннелей
+  repeated string tunnels = 1;
+}
+

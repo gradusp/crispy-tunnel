@@ -96,21 +96,18 @@ func (srv *tunnelService) RegisterProxyGW(ctx context.Context, mux *grpcRt.Serve
 //AddTunnel impl tunnel service
 func (srv *tunnelService) AddTunnel(ctx context.Context, req *tunnel.AddTunnelRequest) (resp *emptypb.Empty, err error) {
 	dbgLvl := logger.IsLevelEnabled(ctx, zap.DebugLevel)
-	defer func() {
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				err = status.FromContextError(err).Err()
-			}
-			if status.Code(errors.Cause(err)) == codes.Unknown {
-				err = status.Errorf(codes.Internal, "%v", err)
-			}
-		}
-	}()
-
 	tunnelIP := req.GetTunDestIP()
-
 	span := trace.SpanFromContext(ctx)
 	span.SetAttributes(attribute.String("req-tunnel-IP", tunnelIP))
+
+	var leave func()
+	if leave, err = srv.enter(ctx); err != nil {
+		return nil, err
+	}
+	defer func() {
+		leave()
+		err = srv.correctError(err)
+	}()
 
 	var hcTunDestNetIP net.IP
 	if hcTunDestNetIP, _, err = net.ParseCIDR(tunnelIP + mask32); err != nil {
@@ -119,12 +116,6 @@ func (srv *tunnelService) AddTunnel(ctx context.Context, req *tunnel.AddTunnelRe
 	span.SetAttributes(attribute.String("hcTunDestNetIP", hcTunDestNetIP.String()))
 	tunnelName := fmt.Sprintf("tun%v", netPrivate.IPType(hcTunDestNetIP).Int())
 	span.SetAttributes(attribute.String("tunnel-name", tunnelName))
-
-	var leave func()
-	if leave, err = srv.enter(ctx); err != nil {
-		return nil, err
-	}
-	defer leave()
 
 	if dbgLvl {
 		span.AddEvent("netlink.LinkByName",
@@ -199,33 +190,25 @@ func (srv *tunnelService) AddTunnel(ctx context.Context, req *tunnel.AddTunnelRe
 
 //RemoveTunnel impl tunnel service
 func (srv *tunnelService) RemoveTunnel(ctx context.Context, req *tunnel.RemoveTunnelRequest) (resp *emptypb.Empty, err error) {
-	dbgLvl := logger.IsLevelEnabled(ctx, zap.DebugLevel)
-	defer func() {
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				err = status.FromContextError(err).Err()
-			}
-			if status.Code(errors.Cause(err)) == codes.Unknown {
-				err = status.Errorf(codes.Internal, "%v", err)
-			}
-		}
-	}()
 	tunnelIP := req.GetTunDestIP()
-
 	span := trace.SpanFromContext(ctx)
 	span.SetAttributes(attribute.String("req-tunnel-IP", tunnelIP))
+
+	dbgLvl := logger.IsLevelEnabled(ctx, zap.DebugLevel)
+	var leave func()
+	if leave, err = srv.enter(ctx); err != nil {
+		return nil, err
+	}
+	defer func() {
+		leave()
+		err = srv.correctError(err)
+	}()
 
 	var hcTunDestNetIP net.IP
 	if hcTunDestNetIP, _, err = net.ParseCIDR(tunnelIP + mask32); err != nil {
 		return nil, err
 	}
 	tunnelName := fmt.Sprintf("tun%v", netPrivate.IPType(hcTunDestNetIP).Int())
-
-	var leave func()
-	if leave, err = srv.enter(ctx); err != nil {
-		return nil, err
-	}
-	defer leave()
 
 	if dbgLvl {
 		span.AddEvent("netlink.LinkByName",
@@ -261,7 +244,10 @@ func (srv *tunnelService) GetState(ctx context.Context, _ *emptypb.Empty) (*tunn
 	if err != nil {
 		return nil, err
 	}
-	defer leave()
+	defer func() {
+		leave()
+		err = srv.correctError(err)
+	}()
 	ret := new(tunnel.GetStateResponse)
 	err = srv.enumLinks(func(nl netlink.Link) error {
 		ret.Tunnels = append(ret.Tunnels, nl.Attrs().Name)
@@ -276,6 +262,18 @@ func (srv *tunnelService) GetState(ctx context.Context, _ *emptypb.Empty) (*tunn
 		return strings.EqualFold(l, r)
 	})
 	return ret, nil
+}
+
+func (srv *tunnelService) correctError(err error) error {
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			err = status.FromContextError(err).Err()
+		}
+		if status.Code(errors.Cause(err)) == codes.Unknown {
+			err = status.Errorf(codes.Internal, "%v", err)
+		}
+	}
+	return err
 }
 
 func (srv *tunnelService) enter(ctx context.Context) (leave func(), err error) {

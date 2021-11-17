@@ -5,15 +5,6 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"net"
-	"os/exec"
-	"regexp"
-	"runtime"
-	"sort"
-	"strings"
-	"sync"
-	"syscall"
-
 	netPrivate "github.com/gradusp/crispy-tunnel/internal/pkg/net"
 	"github.com/gradusp/crispy-tunnel/pkg/tunnel"
 	"github.com/gradusp/go-platform/logger"
@@ -29,6 +20,14 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"io"
+	"net"
+	"os/exec"
+	"regexp"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
 )
 
 type tunnelService struct {
@@ -95,10 +94,10 @@ func (srv *tunnelService) RegisterProxyGW(ctx context.Context, mux *grpcRt.Serve
 
 //AddTunnel impl tunnel service
 func (srv *tunnelService) AddTunnel(ctx context.Context, req *tunnel.AddTunnelRequest) (resp *emptypb.Empty, err error) {
-	dbgLvl := logger.IsLevelEnabled(ctx, zap.DebugLevel)
 	tunnelIP := req.GetTunDestIP()
+
 	span := trace.SpanFromContext(ctx)
-	span.SetAttributes(attribute.String("req-tunnel-IP", tunnelIP))
+	span.SetAttributes(attribute.String("tunDestIP", tunnelIP))
 
 	var leave func()
 	if leave, err = srv.enter(ctx); err != nil {
@@ -108,84 +107,54 @@ func (srv *tunnelService) AddTunnel(ctx context.Context, req *tunnel.AddTunnelRe
 		leave()
 		err = srv.correctError(err)
 	}()
+	resp = new(emptypb.Empty)
 
 	var hcTunDestNetIP net.IP
 	if hcTunDestNetIP, _, err = net.ParseCIDR(tunnelIP + mask32); err != nil {
-		return nil, err
+		err = status.Errorf(codes.InvalidArgument, "'tunDestIP': %v",
+			errors.Wrap(err, "net.ParseCIDR"),
+		)
+		return
 	}
 	span.SetAttributes(attribute.String("hcTunDestNetIP", hcTunDestNetIP.String()))
 	tunnelName := fmt.Sprintf("tun%v", netPrivate.IPType(hcTunDestNetIP).Int())
 	span.SetAttributes(attribute.String("tunnel-name", tunnelName))
 
-	if dbgLvl {
-		span.AddEvent("netlink.LinkByName",
-			trace.WithAttributes(attribute.String("tunnel-name", tunnelName)))
-	}
-	if _, e := netlink.LinkByName(tunnelName); e == nil {
-		return nil, status.Errorf(codes.AlreadyExists, "tunnel '%v'", tunnelName)
-	} else if !errors.As(e, new(netlink.LinkNotFoundError)) {
-		return nil, errors.Errorf("netlink.LinkByName('%s') -> %v", tunnelName, e)
+	if _, err = netlink.LinkByName(tunnelName); err == nil {
+		err = status.Errorf(codes.AlreadyExists, "tunnel '%v'", tunnelName)
+		return
+	} else if !errors.As(err, new(netlink.LinkNotFoundError)) {
+		err = errors.Wrapf(err, "netlink.LinkByName('%s')", tunnelName)
+		return
 	}
 	linkNew := &netlink.Iptun{
 		LinkAttrs: netlink.LinkAttrs{Name: tunnelName},
 		Remote:    hcTunDestNetIP,
 	}
-	if dbgLvl {
-		span.AddEvent("netlink.LinkAdd",
-			trace.WithAttributes(
-				attribute.String("tunnel-name", tunnelName),
-				attribute.Stringer("remote", hcTunDestNetIP),
-			),
-		)
-	}
+
+	srv.addSpanDbgEvent(ctx, span, "netlink.LinkAdd",
+		trace.WithAttributes(
+			attribute.String("LinkAttrs.Name", tunnelName),
+			attribute.Stringer("Remote", hcTunDestNetIP),
+		))
 	if err = netlink.LinkAdd(linkNew); err != nil {
-		return nil, errors.Errorf("netlinkLinkAdd('%v') -> %v", tunnelName, err)
+		err = errors.Wrapf(err, "netlink.LinkAdd('%v')", tunnelName)
+		return
 	}
-
-	if dbgLvl {
-		span.AddEvent("netlink.LinkSetUp",
-			trace.WithAttributes(
-				attribute.String("tunnel-name", tunnelName),
-				attribute.Stringer("remote", hcTunDestNetIP),
-			),
-		)
-	}
+	srv.addSpanDbgEvent(ctx, span, "netlink.LinkSetUp")
 	if err = netlink.LinkSetUp(linkNew); err != nil {
-		return nil, errors.Errorf("netlink.LinkSetUp('%v') -> %v", tunnelName, err)
+		err = errors.Wrapf(err, "netlink.LinkSetUp('%v')", tunnelName)
+		return
 	}
-
-	args := []string{"-w", "net.ipv4.conf." + tunnelName + ".rp_filter=0"}
-	cmd := exec.CommandContext(ctx, "sysctl", args...) //nolint:gosec
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Noctty: true,
+	srv.addSpanDbgEvent(ctx, span, "newRpFilter",
+		trace.WithAttributes(
+			attribute.String("tunnelName", tunnelName),
+		),
+	)
+	if err = srv.newRpFilter(ctx, tunnelName); err != nil {
+		err = errors.Wrapf(err, "newRpFilter(%s)", tunnelName)
 	}
-	if dbgLvl {
-		span.AddEvent("exec:sysctl",
-			trace.WithAttributes(
-				attribute.StringSlice("args", args),
-			),
-		)
-	}
-	ch := make(chan error, 1)
-	go func() {
-		defer close(ch)
-		ch <- cmd.Run()
-	}()
-	select {
-	case <-srv.appCtx.Done():
-		err = srv.appCtx.Err()
-		if p := cmd.Process; p != nil {
-			_ = p.Kill()
-		}
-	case err = <-ch:
-	}
-	if err != nil {
-		return nil, errors.Errorf("exec:sysctl -w %s -> %v", args[1], err)
-	}
-	if ec := cmd.ProcessState.ExitCode(); ec != 0 {
-		return nil, errors.Errorf("exec:sysctl -w %s -> exit-code:%v", args[1], ec)
-	}
-	return new(emptypb.Empty), nil
+	return //nolint:nakedret
 }
 
 //RemoveTunnel impl tunnel service
@@ -194,7 +163,6 @@ func (srv *tunnelService) RemoveTunnel(ctx context.Context, req *tunnel.RemoveTu
 	span := trace.SpanFromContext(ctx)
 	span.SetAttributes(attribute.String("req-tunnel-IP", tunnelIP))
 
-	dbgLvl := logger.IsLevelEnabled(ctx, zap.DebugLevel)
 	var leave func()
 	if leave, err = srv.enter(ctx); err != nil {
 		return nil, err
@@ -203,39 +171,40 @@ func (srv *tunnelService) RemoveTunnel(ctx context.Context, req *tunnel.RemoveTu
 		leave()
 		err = srv.correctError(err)
 	}()
+	resp = new(emptypb.Empty)
 
 	var hcTunDestNetIP net.IP
 	if hcTunDestNetIP, _, err = net.ParseCIDR(tunnelIP + mask32); err != nil {
-		return nil, err
+		err = status.Errorf(codes.InvalidArgument, "'tunDestIP': %v",
+			errors.Wrap(err, "net.ParseCIDR"),
+		)
+		return
 	}
 	tunnelName := fmt.Sprintf("tun%v", netPrivate.IPType(hcTunDestNetIP).Int())
 
-	if dbgLvl {
-		span.AddEvent("netlink.LinkByName",
-			trace.WithAttributes(attribute.String("tunnel-name", tunnelName)))
-	}
 	var linkOld netlink.Link
 	linkOld, err = netlink.LinkByName(tunnelName)
-	if err != nil && !errors.As(err, new(netlink.LinkNotFoundError)) {
-		return nil, errors.Errorf("netlink.LinkByName(%s) -> %v", tunnelName, err)
+	if errors.As(err, new(netlink.LinkNotFoundError)) {
+		err = status.Errorf(codes.NotFound, "tunnel '%v' is not found", tunnelName)
+		return
+	} else if err != nil {
+		err = errors.Wrapf(err, "netlink.LinkByName(%s)", tunnelName)
+		return
 	}
-
-	if dbgLvl {
-		span.AddEvent("netlink.LinkSetDown",
-			trace.WithAttributes(attribute.String("tunnel-name", tunnelName)))
-	}
+	srv.addSpanDbgEvent(ctx, span, "netlink.LinkSetDown",
+		trace.WithAttributes(attribute.String("tunnel-name", tunnelName)),
+	)
 	if err = netlink.LinkSetDown(linkOld); err != nil {
-		return nil, errors.Errorf("netlink.LinkSetDown(%s) -> %v", tunnelName, err)
+		err = errors.Wrapf(err, "netlink.LinkSetDown(%s)", tunnelName)
+		return
 	}
-
-	if dbgLvl {
-		span.AddEvent("netlink.LinkDel",
-			trace.WithAttributes(attribute.String("tunnel-name", tunnelName)))
-	}
+	srv.addSpanDbgEvent(ctx, span, "netlink.LinkDel",
+		trace.WithAttributes(attribute.String("tunnel-name", tunnelName)),
+	)
 	if err = netlink.LinkDel(linkOld); err != nil {
-		return nil, errors.Errorf("netlink.LinkDel(%s) -> %v", tunnelName, err)
+		err = errors.Wrapf(err, "netlink.LinkDel(%s)", tunnelName)
 	}
-	return new(emptypb.Empty), nil
+	return //nolint:nakedret
 }
 
 //GetState impl tunnel service
@@ -274,6 +243,54 @@ func (srv *tunnelService) correctError(err error) error {
 		}
 	}
 	return err
+}
+
+func (srv *tunnelService) addSpanDbgEvent(ctx context.Context, span trace.Span, eventName string, opts ...trace.EventOption) {
+	if logger.IsLevelEnabled(ctx, zap.DebugLevel) {
+		span.AddEvent(eventName, opts...)
+	}
+}
+
+func (srv *tunnelService) newRpFilter(ctx context.Context, tunnelName string) error {
+	cmd := "sysctl"
+	args := fmt.Sprintf("-w net.ipv4.conf.%s.rp_filter=0", tunnelName)
+	ec, err := srv.execExternal(ctx, nil, cmd, args)
+	if err != nil {
+		return errors.Wrapf(err, "exec-of:%s %s", cmd, args)
+	}
+	if ec != 0 {
+		return errors.Errorf("exec-of:%s %s -> exit-code(%v)", cmd, args, ec)
+	}
+	return nil
+}
+
+func (srv *tunnelService) execExternal(ctx context.Context, output io.Writer, command string, args ...string) (exitCode int, err error) {
+	cmd := exec.Command(command, args...) //nolint:gosec
+	if output != nil {
+		cmd.Stdout = output
+	}
+	if err = cmd.Start(); err != nil {
+		return
+	}
+	ch := make(chan error, 1)
+	go func() {
+		defer close(ch)
+		ch <- cmd.Wait()
+	}()
+	select {
+	case <-ctx.Done():
+		err = ctx.Err()
+	case <-srv.appCtx.Done():
+		err = srv.appCtx.Err()
+	case err = <-ch:
+		if err == nil {
+			exitCode = cmd.ProcessState.ExitCode()
+		}
+	}
+	if err == context.Canceled || err == context.DeadlineExceeded {
+		_ = cmd.Process.Kill()
+	}
+	return
 }
 
 func (srv *tunnelService) enter(ctx context.Context) (leave func(), err error) {

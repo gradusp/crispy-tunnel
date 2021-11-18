@@ -5,6 +5,16 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
+	"net/url"
+	"os/exec"
+	"regexp"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+
 	netPrivate "github.com/gradusp/crispy-tunnel/internal/pkg/net"
 	"github.com/gradusp/crispy-tunnel/pkg/tunnel"
 	"github.com/gradusp/go-platform/logger"
@@ -20,14 +30,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
-	"io"
-	"net"
-	"os/exec"
-	"regexp"
-	"runtime"
-	"sort"
-	"strings"
-	"sync"
 )
 
 type tunnelService struct {
@@ -234,12 +236,26 @@ func (srv *tunnelService) GetState(ctx context.Context, _ *emptypb.Empty) (*tunn
 }
 
 func (srv *tunnelService) correctError(err error) error {
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			err = status.FromContextError(err).Err()
-		}
-		if status.Code(errors.Cause(err)) == codes.Unknown {
-			err = status.Errorf(codes.Internal, "%v", err)
+	if err != nil && status.Code(err) == codes.Unknown {
+		switch errors.Cause(err) {
+		case context.DeadlineExceeded:
+			return status.New(codes.DeadlineExceeded, err.Error()).Err()
+		case context.Canceled:
+			return status.New(codes.Canceled, err.Error()).Err()
+		default:
+			if e := new(url.Error); errors.As(err, &e) {
+				switch errors.Cause(e.Err) {
+				case context.Canceled:
+					return status.New(codes.Canceled, err.Error()).Err()
+				case context.DeadlineExceeded:
+					return status.New(codes.DeadlineExceeded, err.Error()).Err()
+				default:
+					if e.Timeout() {
+						return status.New(codes.DeadlineExceeded, err.Error()).Err()
+					}
+				}
+			}
+			err = status.New(codes.Internal, err.Error()).Err()
 		}
 	}
 	return err

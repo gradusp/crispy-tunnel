@@ -122,7 +122,7 @@ func (srv *tunnelService) AddTunnel(ctx context.Context, req *tunnel.AddTunnelRe
 	span.SetAttributes(attribute.String("tunnel-name", tunnelName))
 
 	if _, err = netlink.LinkByName(tunnelName); err == nil {
-		err = status.Errorf(codes.AlreadyExists, "tunnel '%v'", tunnelName)
+		err = status.Errorf(codes.AlreadyExists, "tunnel '%v' already exist", tunnelName)
 		return
 	} else if !errors.As(err, new(netlink.LinkNotFoundError)) {
 		err = errors.Wrapf(err, "netlink/LinkByName '%s'", tunnelName)
